@@ -391,6 +391,34 @@ class EagleSpeculator:
             )
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            if not (dummy_run and skip_attn_for_dummy_run):
+                # Update attention metadata buffers before CUDA graph replay.
+                # The scheduler_metadata_buffer (used by DeepGEMM's
+                # fp8_paged_mqa_logits kernel) must reflect current seq_lens,
+                # not the dummy values from graph capture time.
+                num_reqs_cg = batch_desc.num_tokens
+                query_start_loc_cpu = torch.arange(
+                    num_reqs_cg + 1, dtype=torch.int32, device="cpu"
+                )
+                block_tables_cg = [
+                    x[:num_reqs_cg]
+                    for x in self.block_tables.input_block_tables
+                ]
+                build_attn_metadata(
+                    attn_groups=self.attn_groups,
+                    num_reqs=num_reqs_cg,
+                    num_tokens=num_reqs_cg,
+                    query_start_loc_gpu=self.input_buffers.query_start_loc[
+                        :num_reqs_cg + 1
+                    ],
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    max_query_len=1,
+                    seq_lens=self.input_buffers.seq_lens[:num_reqs_cg],
+                    max_seq_len=self.max_model_len,
+                    block_tables=block_tables_cg,
+                    slot_mappings=slot_mappings,
+                    kv_cache_config=self.kv_cache_config,
+                )
             return self.cudagraph_manager.run_fullgraph(batch_desc)[:num_reqs]
 
         # Run eager or piecewise CUDA graph.
