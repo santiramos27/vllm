@@ -293,8 +293,6 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
 
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int = 1
-    natively_supported_next_n: list[int] = [1, 2]
-    # TODO (matt): integrate kernel with next_n = 4 support
 
     @classmethod
     def get_cudagraph_support(
@@ -316,6 +314,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         next_n = self.num_speculative_tokens + 1
         self.reorder_batch_threshold += self.num_speculative_tokens
+
+        # DeepGEMM's fp8_paged_mqa_logits supports next_n ∈ {1, 2} on the main
+        # branch. The pre-release nv_dev branch adds next_n == 4 (MTP=3) on
+        # Blackwell via a 2-way CTA multicast. Opt in with VLLM_USE_DEEP_GEMM_MTP3;
+        # when disabled, MTP=3 falls back to batch expansion.
+        self.use_native_mtp3 = (
+            envs.VLLM_USE_DEEP_GEMM_MTP3
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+            and next_n == 4
+        )
+        self.natively_supported_next_n: list[int] = (
+            [1, 2, 4] if self.use_native_mtp3 else [1, 2]
+        )
         self.use_flattening = next_n not in self.natively_supported_next_n
 
         sm_count = num_compute_units(self.device.index)
@@ -366,6 +378,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.scheduler_metadata_buffer = torch.empty(
             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
         )
+        # The next_n=4 kernel cooperates two CTAs via multicast, so the
+        # scheduler metadata is sized for half the SM slots.
+        if self.use_native_mtp3:
+            self.scheduler_metadata_buffer_mtp3 = torch.empty(
+                (self.num_sms // 2 + 1, 2),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            self.scheduler_metadata_buffer_mtp3 = None
 
     def build_one_prefill_chunk(
         self,
@@ -609,12 +631,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
             )
 
+            # The MTP=3 kernel path uses a dedicated metadata buffer sized
+            # for half the SMs (see __init__ comment).
+            if self.use_native_mtp3 and use_native:
+                schedule_metadata_buffer = self.scheduler_metadata_buffer_mtp3
+                schedule_metadata_sms = self.num_sms // 2
+            else:
+                schedule_metadata_buffer = self.scheduler_metadata_buffer
+                schedule_metadata_sms = self.num_sms
+
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             if current_platform.is_cuda() and has_deep_gemm():
-                self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
+                schedule_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.block_size,
-                    self.num_sms,
+                    schedule_metadata_sms,
                 )
 
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
@@ -622,7 +653,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
-                schedule_metadata=self.scheduler_metadata_buffer,
+                schedule_metadata=schedule_metadata_buffer,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

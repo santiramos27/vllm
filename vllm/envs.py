@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_USE_DEEP_GEMM_MTP3: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1231,6 +1232,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+    ),
+    # Opt in to DeepGEMM's pre-release (nv_dev branch) next_n=4 variant of
+    # fp8_paged_mqa_logits. When set, sparse MLA with num_speculative_tokens=3
+    # skips batch expansion and calls the kernel natively. Only takes effect on
+    # SM100+ (Blackwell); falls back to batch expansion otherwise. If the
+    # installed DeepGEMM does not include the nv_dev kernel, the call will
+    # raise at runtime.
+    "VLLM_USE_DEEP_GEMM_MTP3": lambda: bool(
+        int(os.getenv("VLLM_USE_DEEP_GEMM_MTP3", "0"))
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no

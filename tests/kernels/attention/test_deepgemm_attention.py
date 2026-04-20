@@ -5,6 +5,7 @@ import random
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     _ceil_to_ue8m0,
@@ -298,3 +299,110 @@ def test_deepgemm_fp8_paged_mqa_logits(clean_logits: bool):
                 ref_logits = ref_logits.masked_fill(~mask, 0)
                 diff = calc_diff(logits, ref_logits)
                 assert diff < 1e-3, f"{diff=}"
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="DeepGEMM next_n=4 kernel is SM100-only",
+)
+@pytest.mark.skipif(
+    not envs.VLLM_USE_DEEP_GEMM_MTP3,
+    reason="Requires the pre-release nv_dev DeepGEMM; opt in via VLLM_USE_DEEP_GEMM_MTP3=1",  # noqa
+)
+@pytest.mark.parametrize("clean_logits", [True, False])
+def test_deepgemm_fp8_paged_mqa_logits_next_n4(clean_logits: bool):
+    """Exercise the nv_dev DeepGEMM kernel for MTP=3 (next_n=4).
+
+    Matches TRT-LLM's invocation: two CTAs cooperate per request via multicast,
+    so the scheduler metadata is sized with num_sms // 2.
+    """
+    torch.manual_seed(0)
+    random.seed(0)
+
+    max_model_len = 4096
+    batch_size, next_n = 4, 4
+    heads, index_dim = 32, 128
+    avg_kv = 2048
+    num_blocks, blocksize = max_model_len * 2, 64
+
+    q = torch.randn(
+        (batch_size, next_n, heads, index_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    kv_cache = torch.randn(
+        (num_blocks, blocksize, 1, index_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    weights = torch.randn(
+        (batch_size * next_n, heads),
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    context_lens = (
+        torch.randint(int(0.8 * avg_kv), int(1.2 * avg_kv), (batch_size,))
+        .cuda()
+        .to(torch.int32)
+    )
+    max_block_len = (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
+    block_tables = torch.zeros(
+        (batch_size, max_block_len),
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    counter = 0
+    block_idx_pool = list(range(num_blocks))
+    random.shuffle(block_idx_pool)
+    for i in range(batch_size):
+        ctx_len = int(context_lens[i].item())
+        for j in range((ctx_len + blocksize - 1) // blocksize):
+            block_tables[i][j] = block_idx_pool[counter]
+            counter += 1
+
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
+
+    # next_n=4 uses 2-way multicast, so the scheduler sees half the SMs.
+    schedule_metadata = get_paged_mqa_logits_metadata(
+        context_lens, blocksize, get_num_sms() // 2
+    )
+    logits = fp8_paged_mqa_logits(
+        q_fp8,
+        kv_cache_fp8,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata,
+        max_model_len,
+        clean_logits=clean_logits,
+    )
+
+    ref_logits = _ref_fp8_paged_mqa_logits(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+    )
+
+    positions = (
+        torch.arange(max_model_len, device="cuda")
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    row_indices = torch.arange(batch_size * next_n, device="cuda") // next_n
+    next_n_offset = torch.arange(batch_size * next_n, device="cuda") % next_n
+    mask = positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(
+        1
+    )
+
+    logits = logits.masked_fill(~mask, 0)
+    ref_logits = ref_logits.masked_fill(~mask, 0)
+    diff = calc_diff(logits, ref_logits)
+    assert diff < 1e-3, f"{diff=}"
