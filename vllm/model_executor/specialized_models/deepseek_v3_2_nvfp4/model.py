@@ -76,9 +76,24 @@ class DeepseekV32Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
+        input_layernorm_applied = False
+        for i, layer in enumerate(self.layers):
+            next_layernorm = (
+                self.layers[i + 1].input_layernorm
+                if i + 1 < len(self.layers)
+                else self.norm
+            )
+            hidden_states, residual, input_layernorm_applied = (
+                layer.forward_maybe_fused_moe_norm(
+                    positions,
+                    hidden_states,
+                    residual,
+                    input_layernorm_applied=input_layernorm_applied,
+                    next_layernorm=next_layernorm,
+                )
+            )
+        if not input_layernorm_applied:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 

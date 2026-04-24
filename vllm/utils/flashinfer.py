@@ -149,7 +149,39 @@ _is_fi_autotuning: bool = False
 @functools.cache
 def has_flashinfer_comm() -> bool:
     """Return `True` if FlashInfer comm module is available."""
-    return has_flashinfer() and importlib.util.find_spec("flashinfer.comm") is not None
+    if not has_flashinfer():
+        return False
+    try:
+        return importlib.util.find_spec("flashinfer.comm") is not None
+    except Exception as e:
+        logger.debug_once(
+            "FlashInfer comm unavailable: failed to inspect flashinfer.comm: %s",
+            e,
+        )
+        return False
+
+
+@functools.cache
+def has_flashinfer_moe_finalize_allreduce() -> bool:
+    """Return `True` if FlashInfer exposes the MoE finalize+AR+RMSNorm path."""
+    if not has_flashinfer_comm():
+        return False
+    try:
+        comm = importlib.import_module("flashinfer.comm")
+    except Exception as e:
+        logger.debug_once(
+            "FlashInfer MoE finalize allreduce unavailable: failed to import "
+            "flashinfer.comm: %s",
+            e,
+        )
+        return False
+
+    patterns = getattr(comm, "AllReduceFusionPattern", None)
+    return (
+        hasattr(comm, "allreduce_fusion")
+        and patterns is not None
+        and hasattr(patterns, "kMoEFinalizeARResidualRMSNorm")
+    )
 
 
 @functools.cache
@@ -787,6 +819,7 @@ __all__ = [
     "autotune",
     "has_flashinfer_moe",
     "has_flashinfer_comm",
+    "has_flashinfer_moe_finalize_allreduce",
     "has_flashinfer_nvlink_two_sided",
     "has_flashinfer_nvlink_one_sided",
     "has_flashinfer_cutlass_fused_moe",

@@ -995,6 +995,28 @@ class FusedMoEExpertsMonolithic(FusedMoEExperts):
         """
         raise NotImplementedError
 
+    def apply_without_finalize(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        # grouped topk + fused topk bias parameters
+        num_expert_group: int | None = None,
+        e_score_correction_bias: torch.Tensor | None = None,
+        routed_scaling_factor: float | None = None,
+        topk_group: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Same as apply(), but returns intermediate tensors before MoE finalize.
+        """
+        raise NotImplementedError
+
 
 ################################################################################
 # Kernel
@@ -1466,6 +1488,52 @@ class FusedMoEKernelMonolithicImpl:
 
         return output
 
+    def apply_without_finalize(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        # grouped topk + fused topk bias parameters
+        num_expert_group: int | None = None,
+        e_score_correction_bias: torch.Tensor | None = None,
+        routed_scaling_factor: float | None = None,
+        topk_group: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Same as apply(), but leaves the MoE finalize step to a later fused op.
+
+        This is currently implemented by FlashInfer TRTLLM MoE kernels, which
+        can return (gemm2_output, expert_weights, expanded_idx_to_permuted_idx).
+        """
+        a1q, a1q_scale, router_logits = self.prepare_finalize.prepare(
+            hidden_states,
+            router_logits=router_logits,
+            quant_config=self.fused_experts.quant_config,
+            defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+        )
+
+        return self.fused_experts.apply_without_finalize(
+            hidden_states=a1q,
+            w1=w1,
+            w2=w2,
+            router_logits=router_logits,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            a1q_scale=a1q_scale,
+            # grouped topk + fused topk bias parameters
+            num_expert_group=num_expert_group,
+            e_score_correction_bias=e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+            topk_group=topk_group,
+        )
+
 
 @final
 class FusedMoEKernel:
@@ -1569,6 +1637,38 @@ class FusedMoEKernel:
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelMonolithicImpl)
         return self.impl.apply(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            router_logits=router_logits,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            num_expert_group=num_expert_group,
+            e_score_correction_bias=e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+            topk_group=topk_group,
+        )
+
+    def apply_monolithic_without_finalize(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        # grouped topk + fused topk bias parameters
+        num_expert_group: int | None = None,
+        e_score_correction_bias: torch.Tensor | None = None,
+        routed_scaling_factor: float | None = None,
+        topk_group: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert isinstance(self.impl, FusedMoEKernelMonolithicImpl)
+        return self.impl.apply_without_finalize(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,

@@ -19,6 +19,7 @@ from torch import nn
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -34,11 +35,14 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.platforms import current_platform
+from vllm.utils.flashinfer import has_flashinfer_moe_finalize_allreduce
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
 from .kernels import fused_norm_rope, fused_q
 from .sparse_indexer import sparse_attn_indexer
+
+logger = init_logger(__name__)
 
 
 def dsa(
@@ -182,6 +186,110 @@ direct_register_custom_op(
 )
 
 
+def _get_moe_finalize_allreduce_workspace(
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+):
+    from vllm.distributed import get_tp_group
+    from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+        get_fi_ar_quant_workspace,
+    )
+    from vllm.distributed.parallel_state import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    return get_fi_ar_quant_workspace(
+        world_size=get_tensor_model_parallel_world_size(),
+        rank=get_tensor_model_parallel_rank(),
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        group=get_tp_group().device_group,
+    )
+
+
+def deepseek_moe_finalize_allreduce_rmsnorm(
+    allreduce_in: torch.Tensor,
+    residual_in: torch.Tensor,
+    rms_gamma: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_scale_factor: torch.Tensor,
+    norm_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    shared_expert_output: torch.Tensor | None,
+    rms_eps: float,
+    max_token_num: int,
+    launch_with_pdl: bool,
+) -> torch.Tensor:
+    import flashinfer.comm as flashinfer_comm
+
+    workspace = _get_moe_finalize_allreduce_workspace(
+        max_token_num=max_token_num,
+        hidden_dim=residual_in.shape[-1],
+        dtype=allreduce_in.dtype,
+    )
+    if workspace is None:
+        raise RuntimeError(
+            "FlashInfer TRTLLM allreduce workspace is unavailable for "
+            "DeepSeek V3.2 MoE finalize fusion."
+        )
+
+    flashinfer_comm.allreduce_fusion(
+        input=allreduce_in,
+        workspace=workspace,
+        pattern=flashinfer_comm.AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
+        launch_with_pdl=launch_with_pdl,
+        residual_in=residual_in,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        rms_gamma=rms_gamma,
+        rms_eps=rms_eps,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        expert_scale_factor=expert_scale_factor,
+        shared_expert_output=shared_expert_output,
+    )
+    return norm_out
+
+
+def deepseek_moe_finalize_allreduce_rmsnorm_fake(
+    allreduce_in: torch.Tensor,
+    residual_in: torch.Tensor,
+    rms_gamma: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_scale_factor: torch.Tensor,
+    norm_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    shared_expert_output: torch.Tensor | None,
+    rms_eps: float,
+    max_token_num: int,
+    launch_with_pdl: bool,
+) -> torch.Tensor:
+    del (
+        allreduce_in,
+        residual_in,
+        rms_gamma,
+        expanded_idx_to_permuted_idx,
+        expert_scale_factor,
+        residual_out,
+        shared_expert_output,
+        rms_eps,
+        max_token_num,
+        launch_with_pdl,
+    )
+    return norm_out
+
+
+direct_register_custom_op(
+    op_name="deepseek_moe_finalize_allreduce_rmsnorm",
+    op_func=deepseek_moe_finalize_allreduce_rmsnorm,
+    fake_impl=deepseek_moe_finalize_allreduce_rmsnorm_fake,
+    mutates_args=["norm_out", "residual_out"],
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
 class DeepseekV32DecoderLayer(nn.Module):
     """
     Single decoder layer: norm -> attn -> norm -> MoE/MLP.
@@ -217,6 +325,9 @@ class DeepseekV32DecoderLayer(nn.Module):
         parallel_config = vllm_config.parallel_config
         self.indexer_workspace_size = get_max_prefill_buffer_size(vllm_config)
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
 
         # Use the regular vLLM RMSNorm modules so the compiler sees the
         # canonical residual-add + RMSNorm pattern.
@@ -300,10 +411,29 @@ class DeepseekV32DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual, _ = self.forward_maybe_fused_moe_norm(
+            positions,
+            hidden_states,
+            residual,
+            input_layernorm_applied=False,
+            next_layernorm=None,
+        )
+        return hidden_states, residual
+
+    def forward_maybe_fused_moe_norm(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        input_layernorm_applied: bool,
+        next_layernorm: RMSNorm | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """Forward layer, optionally fusing MoE finalize into next RMSNorm."""
         if residual is None:
+            assert not input_layernorm_applied
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        else:
+        elif not input_layernorm_applied:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # Step 1. hidden_states -> q_c, kv_c, k_pe
@@ -345,8 +475,158 @@ class DeepseekV32DecoderLayer(nn.Module):
 
         hidden_states, _ = self.attn.o_proj(attn_out)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        if self.is_moe and next_layernorm is not None:
+            fused = self._try_fused_moe_finalize_allreduce_rmsnorm(
+                hidden_states,
+                residual,
+                next_layernorm,
+            )
+            if fused is not None:
+                hidden_states, residual = fused
+                return hidden_states, residual, True
+
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return hidden_states, residual, False
+
+    def _can_use_fused_moe_finalize_allreduce(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        next_layernorm: RMSNorm,
+    ) -> bool:
+        if self.tp_size <= 1:
+            return False
+        if not current_platform.is_cuda():
+            return False
+        if not has_flashinfer_moe_finalize_allreduce():
+            return False
+        if hidden_states.dtype != torch.bfloat16:
+            return False
+        if hidden_states.shape[0] > self.max_num_batched_tokens:
+            return False
+        if not hidden_states.is_contiguous() or not residual.is_contiguous():
+            return False
+        if hidden_states.shape != residual.shape:
+            return False
+        if hidden_states.shape[-1] != self.hidden_size:
+            return False
+        if not next_layernorm.has_weight:
+            return False
+        if next_layernorm.variance_size_override is not None:
+            return False
+
+        mlp = self.mlp
+        if getattr(mlp, "is_sequence_parallel", False):
+            return False
+        if getattr(mlp, "ep_size", 1) != 1:
+            return False
+        if getattr(mlp, "is_rocm_aiter_moe_enabled", False):
+            return False
+
+        experts = mlp.experts
+        moe_parallel_config = experts.moe_parallel_config
+        if moe_parallel_config.dp_size != 1 or moe_parallel_config.pcp_size != 1:
+            return False
+        if getattr(experts, "_routed_input_transform", None) is not None:
+            return False
+
+        quant_method = experts.quant_method
+        moe_kernel = getattr(quant_method, "moe_kernel", None)
+        if moe_kernel is None or not getattr(moe_kernel, "is_monolithic", False):
+            return False
+        if not hasattr(moe_kernel, "apply_monolithic_without_finalize"):
+            return False
+
+        try:
+            workspace = _get_moe_finalize_allreduce_workspace(
+                max_token_num=self.max_num_batched_tokens,
+                hidden_dim=self.hidden_size,
+                dtype=hidden_states.dtype,
+            )
+            if workspace is None:
+                return False
+            return workspace.is_buffer_size_sufficient(
+                self.tp_size,
+                hidden_states.shape[0],
+                self.hidden_size,
+                hidden_states.dtype,
+            )
+        except Exception as e:
+            logger.warning_once(
+                "Disabling DeepSeek V3.2 fused MoE finalize allreduce RMSNorm: %s",
+                e,
+            )
+            return False
+
+    def _try_fused_moe_finalize_allreduce_rmsnorm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        next_layernorm: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self._can_use_fused_moe_finalize_allreduce(
+            hidden_states,
+            residual,
+            next_layernorm,
+        ):
+            return None
+
+        mlp = self.mlp
+        experts = mlp.experts
+        experts.ensure_moe_quant_config_init()
+        router_logits, _ = mlp.gate(hidden_states)
+
+        shared_output = (
+            mlp.shared_experts(hidden_states)
+            if mlp.shared_experts is not None
+            else None
+        )
+
+        moe_kernel = experts.quant_method.moe_kernel
+        assert moe_kernel is not None
+        allreduce_in, expert_scale_factor, expanded_idx_to_permuted_idx = (
+            moe_kernel.apply_monolithic_without_finalize(
+                hidden_states,
+                experts.w13_weight,
+                experts.w2_weight,
+                router_logits,
+                activation=experts.activation,
+                global_num_experts=experts.global_num_experts,
+                expert_map=experts.expert_map,
+                apply_router_weight_on_input=experts.apply_router_weight_on_input,
+                num_expert_group=experts.num_expert_group,
+                topk_group=experts.topk_group,
+                e_score_correction_bias=experts.e_score_correction_bias,
+                routed_scaling_factor=experts.routed_scaling_factor,
+            )
+        )
+
+        # Match DeepseekV2MoE.forward(): TRTLLM monolithic kernels use a
+        # routed_scaling_factor of 1.0, so vLLM applies the model scaling after
+        # expert reduction. Scaling the router weights is equivalent before
+        # FlashInfer's deferred finalize reduction.
+        if hidden_states.dtype != torch.float16:
+            expert_scale_factor = expert_scale_factor * mlp.routed_scaling_factor
+        elif shared_output is not None:
+            shared_output = shared_output * (1.0 / mlp.routed_scaling_factor)
+
+        norm_out = torch.empty_like(residual)
+        residual_out = torch.empty_like(residual)
+        norm_out = torch.ops.vllm.deepseek_moe_finalize_allreduce_rmsnorm(
+            allreduce_in,
+            residual,
+            next_layernorm.weight.data,
+            expanded_idx_to_permuted_idx,
+            expert_scale_factor,
+            norm_out,
+            residual_out,
+            shared_output,
+            next_layernorm.variance_epsilon,
+            self.max_num_batched_tokens,
+            True,
+        )
+        return norm_out, residual_out
 
     def fuse_indexer_weights(self) -> None:
         """Fuse Step 1 and Step 3 BF16 linears used by the inlined path.
