@@ -683,6 +683,18 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 addr_list.append(addr)
                 size_list.append(size)
 
+        if not key_list:
+            logger.warning(
+                "No Mooncake keys to load for request %s after filtering "
+                "(token_len=%d, mask_num=%d)",
+                req_id,
+                token_len,
+                mask_num,
+            )
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
+
         # Rotate lists by tp_rank for load balancing
         rotation = self.tp_rank % len(key_list)
         key_list_c = key_list[rotation:] + key_list[:rotation]

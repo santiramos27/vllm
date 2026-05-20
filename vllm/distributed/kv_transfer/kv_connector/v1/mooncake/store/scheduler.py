@@ -374,10 +374,18 @@ class MooncakeStoreScheduler:
         if self.kv_role == "kv_consumer":
             return False, None
         tracker = self._request_trackers.get(request.request_id)
-        assert tracker is not None
+        total_blocks = sum(len(g) for g in block_ids)
+        if tracker is None:
+            delay_free_blocks = total_blocks > 0
+            logger.warning(
+                "MooncakeStore request_finished called without tracker for "
+                "request %s; delaying free for %d blocks",
+                request.request_id,
+                total_blocks,
+            )
+            return delay_free_blocks, None
         if tracker.num_saved_tokens <= 0:
             return False, None
-        total_blocks = sum(len(g) for g in block_ids)
         delay_free_blocks = total_blocks > 0
         if delay_free_blocks:
             logger.debug(
